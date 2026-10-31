@@ -1,0 +1,1253 @@
+
+import sys
+import time
+import uuid
+import sqlite3
+import subprocess
+import urllib.request
+from pathlib import Path
+
+from flask import (
+    Flask, request, redirect, url_for,
+    session, flash, render_template_string
+)
+from werkzeug.security import generate_password_hash, check_password_hash
+from playwright.sync_api import sync_playwright, expect
+
+
+# ============================================================
+# CONFIGURATION
+# ============================================================
+
+app = Flask(__name__)
+app.secret_key = "findit-demo-secret-key-change-before-production"
+
+BASE_DIR = Path(__file__).resolve().parent
+DB_PATH = BASE_DIR / "findit.db"
+BASE_URL = "http://127.0.0.1:5000"
+
+TEST_PASSWORD = "RiyaPass123"
+BROWSER_NAMES = ["chromium", "firefox", "webkit"]
+
+# Set to True to keep the final Lost Items page open.
+SHOW_FINAL_PAGE = True
+FINAL_PAGE_SECONDS = 10
+
+
+# ============================================================
+# DATABASE
+# ============================================================
+
+def get_db():
+    connection = sqlite3.connect(DB_PATH)
+    connection.row_factory = sqlite3.Row
+    return connection
+
+
+def init_db():
+    with get_db() as db:
+        db.execute("""
+            CREATE TABLE IF NOT EXISTS users (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                name TEXT NOT NULL,
+                email TEXT NOT NULL UNIQUE,
+                password TEXT NOT NULL
+            )
+        """)
+
+        db.execute("""
+            CREATE TABLE IF NOT EXISTS items (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                user_id INTEGER NOT NULL,
+                title TEXT NOT NULL,
+                category TEXT NOT NULL,
+                description TEXT NOT NULL,
+                location TEXT NOT NULL,
+                status TEXT NOT NULL,
+                contact TEXT NOT NULL,
+                created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+                FOREIGN KEY(user_id) REFERENCES users(id)
+            )
+        """)
+
+
+# ============================================================
+# WEBSITE STYLE
+# ============================================================
+
+PAGE_STYLE = """
+<style>
+* { box-sizing: border-box; }
+
+body {
+    margin: 0;
+    font-family: Arial, sans-serif;
+    background: #f2f7f8;
+    color: #263238;
+}
+
+nav {
+    background: #087f8c;
+    padding: 16px 5%;
+    display: flex;
+    flex-wrap: wrap;
+    align-items: center;
+    gap: 18px;
+}
+
+nav .brand {
+    color: white;
+    font-size: 23px;
+    font-weight: bold;
+    margin-right: auto;
+    text-decoration: none;
+}
+
+nav a {
+    color: white;
+    text-decoration: none;
+    font-weight: bold;
+}
+
+.container {
+    width: 92%;
+    max-width: 1000px;
+    margin: 30px auto;
+}
+
+.hero {
+    background: #087f8c;
+    color: white;
+    padding: 38px 25px;
+    border-radius: 12px;
+    text-align: center;
+}
+
+.hero h1 { color: white; }
+
+.card {
+    background: white;
+    padding: 25px;
+    margin: 20px 0;
+    border-radius: 10px;
+    box-shadow: 0 3px 12px rgba(0,0,0,.07);
+}
+
+h1, h2 { color: #075e68; }
+
+label {
+    display: block;
+    margin: 14px 0 6px;
+    font-weight: bold;
+}
+
+input, select, textarea {
+    width: 100%;
+    padding: 11px;
+    border: 1px solid #b7c9cc;
+    border-radius: 5px;
+    font-size: 15px;
+}
+
+textarea {
+    min-height: 90px;
+    resize: vertical;
+}
+
+button, .button {
+    display: inline-block;
+    border: none;
+    background: #087f8c;
+    color: white;
+    padding: 11px 18px;
+    border-radius: 5px;
+    cursor: pointer;
+    text-decoration: none;
+    font-size: 15px;
+    margin-top: 15px;
+}
+
+.alert {
+    background: #fff3cd;
+    border: 1px solid #ffe08a;
+    padding: 12px;
+    margin: 12px 0;
+    border-radius: 5px;
+}
+
+.success {
+    background: #d1e7dd;
+    border-color: #a3cfbb;
+}
+
+.error {
+    background: #f8d7da;
+    border-color: #f1aeb5;
+}
+
+table {
+    width: 100%;
+    border-collapse: collapse;
+    background: white;
+    margin-top: 18px;
+}
+
+th, td {
+    border: 1px solid #d5e0e2;
+    padding: 10px;
+    text-align: left;
+    overflow-wrap: anywhere;
+}
+
+th { background: #dceff1; }
+
+footer {
+    text-align: center;
+    background: #073f46;
+    color: white;
+    padding: 18px;
+    margin-top: 40px;
+}
+
+.small { color: #546e7a; }
+
+@media (max-width: 600px) {
+    nav { gap: 12px; }
+    nav .brand {
+        width: 100%;
+        margin-right: 0;
+    }
+    .container { width: 95%; margin: 15px auto; }
+    .card { padding: 16px; }
+    .hero { padding: 25px 15px; }
+    table { font-size: 13px; }
+    th, td { padding: 6px; }
+}
+</style>
+"""
+
+BASE_TEMPLATE = """
+<!DOCTYPE html>
+<html lang="en">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>{{ page_title }} - FindIt Portal</title>
+    {{ page_style | safe }}
+</head>
+<body>
+<nav>
+    <a class="brand" href="/">FindIt Portal</a>
+    <a href="/">Home</a>
+    <a href="/items">Search Items</a>
+
+    {% if session.get('user_id') %}
+        <a href="/dashboard">Dashboard</a>
+        <a href="/report">Report Item</a>
+        <a href="/logout">Logout</a>
+    {% else %}
+        <a href="/register">Register</a>
+        <a href="/login">Login</a>
+    {% endif %}
+</nav>
+
+<div class="container">
+    {% with messages = get_flashed_messages(with_categories=true) %}
+        {% for category, message in messages %}
+            <div class="alert {{ category }}" role="alert">
+                {{ message }}
+            </div>
+        {% endfor %}
+    {% endwith %}
+
+    {{ body | safe }}
+</div>
+
+<footer>FindIt Portal | Lost and Found Management System</footer>
+</body>
+</html>
+"""
+
+
+def render_page(page_title, body, **context):
+    rendered_body = render_template_string(body, **context)
+    return render_template_string(
+        BASE_TEMPLATE,
+        page_title=page_title,
+        page_style=PAGE_STYLE,
+        body=rendered_body,
+    )
+
+
+# ============================================================
+# AUTHENTICATION
+# ============================================================
+
+def login_required(view_function):
+    from functools import wraps
+
+    @wraps(view_function)
+    def wrapped(*args, **kwargs):
+        if not session.get("user_id"):
+            flash("Please log in to access this page.", "error")
+            return redirect(url_for("login"))
+        return view_function(*args, **kwargs)
+
+    return wrapped
+
+
+# ============================================================
+# HOME
+# ============================================================
+
+@app.route("/")
+def home():
+    body = """
+    <section class="hero">
+        <h1>Welcome to FindIt Portal</h1>
+        <p>Report lost items and help people find their belongings.</p>
+        <a class="button" href="/report">Report an Item</a>
+        <a class="button" href="/items">Search Items</a>
+    </section>
+
+    <section class="card">
+        <h2>Website Modules</h2>
+        <p><strong>Registration:</strong> Create a new account.</p>
+        <p><strong>Login:</strong> Access your personal dashboard.</p>
+        <p><strong>Report Item:</strong> Submit lost or found items.</p>
+        <p><strong>Search:</strong> Search by title, category, or location.</p>
+        <p><strong>Session Management:</strong> Log in and log out.</p>
+    </section>
+    """
+    return render_page("Home", body)
+
+
+# ============================================================
+# REGISTRATION
+# ============================================================
+
+@app.route("/register", methods=["GET", "POST"])
+def register():
+    if request.method == "POST":
+        name = request.form.get("name", "").strip()
+        email = request.form.get("email", "").strip().lower()
+        password = request.form.get("password", "")
+
+        if not name or not email or not password:
+            flash("Please fill in all registration fields.", "error")
+            return redirect(url_for("register"))
+
+        if len(password) < 6:
+            flash("Password must contain at least 6 characters.", "error")
+            return redirect(url_for("register"))
+
+        try:
+            with get_db() as db:
+                db.execute(
+                    """
+                    INSERT INTO users (name, email, password)
+                    VALUES (?, ?, ?)
+                    """,
+                    (name, email, generate_password_hash(password)),
+                )
+
+            flash("Registration successful. Please log in.", "success")
+            return redirect(url_for("login"))
+
+        except sqlite3.IntegrityError:
+            flash("An account with this email already exists.", "error")
+            return redirect(url_for("register"))
+
+    body = """
+    <section class="card">
+        <h1>Create Account</h1>
+        <form method="POST" action="/register">
+            <label for="name">Full Name</label>
+            <input id="name" name="name" required>
+
+            <label for="email">Email Address</label>
+            <input id="email" name="email" type="email" required>
+
+            <label for="password">Password (minimum 6 characters)</label>
+            <input id="password" name="password" type="password"
+                   minlength="6" required>
+
+            <button type="submit">Register</button>
+        </form>
+        <p>Already registered? <a href="/login">Login here</a></p>
+    </section>
+    """
+    return render_page("Register", body)
+
+
+# ============================================================
+# LOGIN
+# ============================================================
+
+@app.route("/login", methods=["GET", "POST"])
+def login():
+    if request.method == "POST":
+        email = request.form.get("email", "").strip().lower()
+        password = request.form.get("password", "")
+
+        with get_db() as db:
+            user = db.execute(
+                "SELECT * FROM users WHERE email = ?",
+                (email,),
+            ).fetchone()
+
+        if user and check_password_hash(user["password"], password):
+            session.clear()
+            session["user_id"] = user["id"]
+            session["user_name"] = user["name"]
+            session["user_email"] = user["email"]
+
+            flash("Login successful.", "success")
+            return redirect(url_for("dashboard"))
+
+        flash("Invalid email or password.", "error")
+        return redirect(url_for("login"))
+
+    body = """
+    <section class="card">
+        <h1>Login</h1>
+        <form method="POST" action="/login">
+            <label for="email">Email Address</label>
+            <input id="email" name="email" type="email" required>
+
+            <label for="password">Password</label>
+            <input id="password" name="password" type="password" required>
+
+            <button type="submit">Login</button>
+        </form>
+        <p>New user? <a href="/register">Create an account</a></p>
+    </section>
+    """
+    return render_page("Login", body)
+
+
+# ============================================================
+# LOGOUT
+# ============================================================
+
+@app.route("/logout")
+def logout():
+    session.clear()
+    flash("You have been logged out successfully.", "success")
+    return redirect(url_for("login"))
+
+
+# ============================================================
+# DASHBOARD
+# ============================================================
+
+@app.route("/dashboard")
+@login_required
+def dashboard():
+    with get_db() as db:
+        reported_items = db.execute(
+            """
+            SELECT * FROM items
+            WHERE user_id = ?
+            ORDER BY id DESC
+            """,
+            (session["user_id"],),
+        ).fetchall()
+
+    body = """
+    <section class="card">
+        <h1>Welcome, {{ name }}!</h1>
+        <p>You are successfully logged in.</p>
+        <a class="button" href="/report">Report Item</a>
+        <a class="button" href="/items">Search Items</a>
+    </section>
+
+    <section class="card">
+        <h2>My Reported Items</h2>
+        {% if items %}
+        <table>
+            <thead>
+                <tr>
+                    <th>Title</th><th>Category</th>
+                    <th>Location</th><th>Status</th>
+                </tr>
+            </thead>
+            <tbody>
+                {% for item in items %}
+                <tr>
+                    <td>{{ item['title'] }}</td>
+                    <td>{{ item['category'] }}</td>
+                    <td>{{ item['location'] }}</td>
+                    <td>{{ item['status'] }}</td>
+                </tr>
+                {% endfor %}
+            </tbody>
+        </table>
+        {% else %}
+        <p id="no-items">You have not reported any items yet.</p>
+        {% endif %}
+    </section>
+    """
+    return render_page(
+        "Dashboard",
+        body,
+        name=session["user_name"],
+        items=reported_items,
+    )
+
+
+# ============================================================
+# REPORT LOST OR FOUND ITEM
+# ============================================================
+
+@app.route("/report", methods=["GET", "POST"])
+@login_required
+def report():
+    if request.method == "POST":
+        title = request.form.get("title", "").strip()
+        category = request.form.get("category", "").strip()
+        description = request.form.get("description", "").strip()
+        location = request.form.get("location", "").strip()
+        status = request.form.get("status", "").strip()
+        contact = request.form.get("contact", "").strip()
+
+        if not all([title, category, description, location, status, contact]):
+            flash("Please complete all item fields.", "error")
+            return redirect(url_for("report"))
+
+        if status not in ("Lost", "Found"):
+            flash("Please select Lost or Found.", "error")
+            return redirect(url_for("report"))
+
+        with get_db() as db:
+            db.execute(
+                """
+                INSERT INTO items
+                (user_id, title, category, description, location, status, contact)
+                VALUES (?, ?, ?, ?, ?, ?, ?)
+                """,
+                (
+                    session["user_id"], title, category, description,
+                    location, status, contact,
+                ),
+            )
+
+        flash("Item reported successfully.", "success")
+        return redirect(url_for("dashboard"))
+
+    body = """
+    <section class="card">
+        <h1>Report Lost or Found Item</h1>
+        <form method="POST" action="/report">
+            <label for="title">Item Title</label>
+            <input id="title" name="title" required>
+
+            <label for="category">Category</label>
+            <select id="category" name="category" required>
+                <option value="">Select Category</option>
+                <option value="Bag">Bag</option>
+                <option value="Mobile Phone">Mobile Phone</option>
+                <option value="Wallet">Wallet</option>
+                <option value="Documents">Documents</option>
+                <option value="Keys">Keys</option>
+                <option value="Other">Other</option>
+            </select>
+
+            <label for="description">Description</label>
+            <textarea id="description" name="description" required></textarea>
+
+            <label for="location">Last Seen / Found Location</label>
+            <input id="location" name="location" required>
+
+            <label for="status">Report Type</label>
+            <select id="status" name="status" required>
+                <option value="">Select Type</option>
+                <option value="Lost">Lost</option>
+                <option value="Found">Found</option>
+            </select>
+
+            <label for="contact">Contact Information</label>
+            <input id="contact" name="contact" required>
+
+            <button type="submit">Submit Report</button>
+        </form>
+    </section>
+    """
+    return render_page("Report Item", body)
+
+
+# ============================================================
+# SEARCH ITEMS
+# ============================================================
+
+@app.route("/items")
+def items():
+    search_term = request.args.get("q", "").strip()
+    status_filter = request.args.get("status", "").strip()
+
+    with get_db() as db:
+        sql = """
+            SELECT items.*, users.name AS reporter
+            FROM items
+            JOIN users ON items.user_id = users.id
+            WHERE 1=1
+        """
+        parameters = []
+
+        if search_term:
+            sql += """
+                AND (
+                    items.title LIKE ?
+                    OR items.category LIKE ?
+                    OR items.location LIKE ?
+                )
+            """
+            parameters.extend([
+                f"%{search_term}%",
+                f"%{search_term}%",
+                f"%{search_term}%",
+            ])
+
+        if status_filter in ("Lost", "Found"):
+            sql += " AND items.status = ?"
+            parameters.append(status_filter)
+
+        sql += " ORDER BY items.id DESC"
+
+        results = db.execute(sql, parameters).fetchall()
+
+    body = """
+    <section class="card">
+        <h1>Search Lost and Found Items</h1>
+        <form method="GET" action="/items">
+            <label for="q">Search by title, category or location</label>
+            <input id="q" name="q" value="{{ search_term }}"
+                   placeholder="Enter item name or location">
+
+            <label for="status">Filter by status</label>
+            <select id="status" name="status">
+                <option value="">All Items</option>
+                <option value="Lost" {% if status_filter == 'Lost' %}selected{% endif %}>Lost</option>
+                <option value="Found" {% if status_filter == 'Found' %}selected{% endif %}>Found</option>
+            </select>
+
+            <button type="submit">Search</button>
+        </form>
+
+        <p class="small">Results: {{ results|length }}</p>
+
+        {% if results %}
+            {% for item in results %}
+            <article class="card item-result">
+                <h2>{{ item['title'] }}</h2>
+                <p><strong>Category:</strong> {{ item['category'] }}</p>
+                <p><strong>Description:</strong> {{ item['description'] }}</p>
+                <p><strong>Location:</strong> {{ item['location'] }}</p>
+                <p><strong>Status:</strong> {{ item['status'] }}</p>
+                <p><strong>Reported by:</strong> {{ item['reporter'] }}</p>
+            </article>
+            {% endfor %}
+        {% else %}
+            <p id="no-results">No matching items found.</p>
+        {% endif %}
+    </section>
+    """
+    return render_page(
+        "Search Items",
+        body,
+        search_term=search_term,
+        status_filter=status_filter,
+        results=results,
+    )
+
+
+# ============================================================
+# HEALTH CHECK
+# ============================================================
+
+@app.route("/health")
+def health():
+    return {"status": "ok", "application": "FindIt Portal"}, 200
+
+
+# ============================================================
+# SERVER STARTUP HELPERS
+# ============================================================
+
+def wait_for_website(server_process, timeout=30):
+    start_time = time.time()
+
+    while time.time() - start_time < timeout:
+        if server_process.poll() is not None:
+            raise RuntimeError(
+                "Flask server stopped. Check whether port 5000 is already in use."
+            )
+
+        try:
+            with urllib.request.urlopen(BASE_URL + "/health", timeout=2) as response:
+                if response.status == 200:
+                    return
+        except Exception:
+            time.sleep(0.5)
+
+    raise RuntimeError("Website did not start within 30 seconds.")
+
+
+# ============================================================
+# TEST REPORTING
+# ============================================================
+
+ALL_RESULTS = []
+
+
+def record_result(browser_name, test_id, test_name, expected, function):
+    print(f"\n[{browser_name.upper()}] {test_id}: {test_name}")
+    print("Expected result:", expected)
+
+    try:
+        actual = function()
+        actual_text = str(actual or "Test assertions completed successfully")
+        passed = True
+        final_result = "Expected behavior observed"
+    except Exception as error:
+        passed = False
+        actual_text = f"{type(error).__name__}: {str(error).splitlines()[0]}"
+        final_result = "Expected behavior not confirmed"
+
+    status = "PASS" if passed else "FAIL"
+
+    row = {
+        "browser": browser_name,
+        "test_id": test_id,
+        "test_name": test_name,
+        "expected": expected,
+        "actual": actual_text,
+        "final": final_result,
+        "status": status,
+    }
+    ALL_RESULTS.append(row)
+
+    print("Actual result:", actual_text)
+    print("Final result:", final_result)
+    print("Status:", status)
+
+    return passed
+
+
+def ensure_logged_in(page, email, password):
+    page.goto(BASE_URL + "/dashboard")
+
+    if page.url.endswith("/login"):
+        page.get_by_label("Email Address").fill(email)
+        page.get_by_label("Password").fill(password)
+        page.get_by_role("button", name="Login").click()
+        expect(page).to_have_url(BASE_URL + "/dashboard")
+
+
+# ============================================================
+# FUNCTIONAL TESTS - RUN ON EACH BROWSER
+# ============================================================
+
+def run_browser_tests(browser_name, browser_type):
+    print("\n" + "=" * 78)
+    print(f"FUNCTIONAL TESTING ON {browser_name.upper()}")
+    print("=" * 78)
+
+    run_id = uuid.uuid4().hex[:8]
+    test_email = f"riya_{run_id}@example.com"
+    known_email = f"known_{run_id}@example.com"
+    unknown_email = f"unknown_{run_id}@example.com"
+
+    item_title = f"Lost Blue Bag {run_id}"
+    item_location = "College Library"
+    item_description = "Blue backpack with notebooks inside"
+
+    with get_db() as db:
+        db.execute(
+            """
+            INSERT INTO users (name, email, password)
+            VALUES (?, ?, ?)
+            """,
+            (
+                "Known Test User",
+                known_email,
+                generate_password_hash("KnownPass123"),
+            ),
+        )
+
+    browser = browser_type.launch(headless=False, slow_mo=350)
+    context = browser.new_context(viewport={"width": 1366, "height": 768})
+    page = context.new_page()
+    page.set_default_timeout(12000)
+
+    try:
+        # TEST 1 - Home page
+        def home_test():
+            response = page.goto(BASE_URL)
+            expect(page.get_by_role(
+                "heading", name="Welcome to FindIt Portal"
+            )).to_be_visible()
+            assert response and response.status == 200
+            return "Home page opened with HTTP 200."
+
+        record_result(
+            browser_name, "FT-01", "Home page loads",
+            "Home page is visible and returns HTTP 200.", home_test
+        )
+
+        # TEST 2 - Unknown email
+        def unknown_email_test():
+            page.goto(BASE_URL + "/login")
+            page.get_by_label("Email Address").fill(unknown_email)
+            page.get_by_label("Password").fill("WrongPass123")
+            page.get_by_role("button", name="Login").click()
+            expect(page.get_by_role("alert")).to_contain_text(
+                "Invalid email or password."
+            )
+            return "Invalid credentials message displayed."
+
+        record_result(
+            browser_name, "FT-02", "Login with unknown email",
+            "Login is rejected and an error message appears.",
+            unknown_email_test
+        )
+
+        # TEST 3 - Incorrect password
+        def wrong_password_test():
+            page.goto(BASE_URL + "/login")
+            page.get_by_label("Email Address").fill(known_email)
+            page.get_by_label("Password").fill("IncorrectPass999")
+            page.get_by_role("button", name="Login").click()
+            expect(page.get_by_role("alert")).to_contain_text(
+                "Invalid email or password."
+            )
+            return "Incorrect password was rejected."
+
+        record_result(
+            browser_name, "FT-03", "Login with incorrect password",
+            "Incorrect password is rejected.", wrong_password_test
+        )
+
+        # TEST 4 - Registration
+        def registration_test():
+            page.goto(BASE_URL + "/register")
+            page.get_by_label("Full Name").fill("Riya Sharma")
+            page.get_by_label("Email Address").fill(test_email)
+            page.get_by_label(
+                "Password (minimum 6 characters)"
+            ).fill(TEST_PASSWORD)
+            page.get_by_role("button", name="Register").click()
+
+            expect(page).to_have_url(BASE_URL + "/login")
+            expect(page.get_by_role("alert")).to_contain_text(
+                "Registration successful."
+            )
+            return "New account registered successfully."
+
+        record_result(
+            browser_name, "FT-04", "Successful registration",
+            "Account is created and user is redirected to Login.",
+            registration_test
+        )
+
+        # TEST 5 - Valid login
+        def valid_login_test():
+            page.goto(BASE_URL + "/login")
+            page.get_by_label("Email Address").fill(test_email)
+            page.get_by_label("Password").fill(TEST_PASSWORD)
+            page.get_by_role("button", name="Login").click()
+
+            expect(page).to_have_url(BASE_URL + "/dashboard")
+            expect(page.get_by_role(
+                "heading", name="Welcome, Riya Sharma!"
+            )).to_be_visible()
+            return "Dashboard opened after successful login."
+
+        record_result(
+            browser_name, "FT-05", "Login with valid credentials",
+            "Valid login opens the user's Dashboard.", valid_login_test
+        )
+
+        # TEST 6 - Report Lost item
+        def report_lost_test():
+            ensure_logged_in(page, test_email, TEST_PASSWORD)
+            page.goto(BASE_URL + "/report")
+
+            page.get_by_label("Item Title").fill(item_title)
+            page.get_by_label("Category").select_option(label="Bag")
+            page.get_by_label("Description").fill(item_description)
+            page.get_by_label(
+                "Last Seen / Found Location"
+            ).fill(item_location)
+            page.get_by_label("Report Type").select_option(label="Lost")
+            page.get_by_label("Contact Information").fill(
+                "riya.test@example.com"
+            )
+            page.get_by_role("button", name="Submit Report").click()
+
+            expect(page).to_have_url(BASE_URL + "/dashboard")
+            expect(page.get_by_role("alert")).to_contain_text(
+                "Item reported successfully."
+            )
+            expect(page.get_by_role(
+                "cell", name=item_title, exact=True
+            )).to_be_visible()
+            return "Lost item saved and shown on the Dashboard."
+
+        record_result(
+            browser_name, "FT-06", "Report a Lost item",
+            "Lost item is saved and appears in the Dashboard.",
+            report_lost_test
+        )
+
+        # TEST 7 - Search
+        def search_test():
+            page.goto(BASE_URL + "/items")
+            page.get_by_label(
+                "Search by title, category or location"
+            ).fill(item_title)
+            page.get_by_role("button", name="Search").click()
+
+            expect(page.get_by_role(
+                "heading", name=item_title, exact=True
+            )).to_be_visible()
+            expect(page.get_by_text(
+                item_location, exact=True
+            )).to_be_visible()
+            expect(page.get_by_text(
+                item_description, exact=True
+            )).to_be_visible()
+            return "Search returned the expected item details."
+
+        record_result(
+            browser_name, "FT-07", "Search for a reported item",
+            "Matching title, location, and description are displayed.",
+            search_test
+        )
+
+        # TEST 8 - Report Found item
+        def report_found_test():
+            ensure_logged_in(page, test_email, TEST_PASSWORD)
+            found_title = f"Found Green Notebook {run_id}"
+
+            page.goto(BASE_URL + "/report")
+            page.get_by_label("Item Title").fill(found_title)
+            page.get_by_label("Category").select_option(label="Documents")
+            page.get_by_label("Description").fill(
+                "Green notebook found during testing"
+            )
+            page.get_by_label(
+                "Last Seen / Found Location"
+            ).fill("College Classroom")
+            page.get_by_label("Report Type").select_option(label="Found")
+            page.get_by_label("Contact Information").fill(
+                "riya.test@example.com"
+            )
+            page.get_by_role("button", name="Submit Report").click()
+
+            expect(page).to_have_url(BASE_URL + "/dashboard")
+            expect(page.get_by_role(
+                "cell", name=found_title, exact=True
+            )).to_be_visible()
+            return "Found item was saved and displayed."
+
+        record_result(
+            browser_name, "FT-08", "Report a Found item",
+            "Found item is saved with Found status.",
+            report_found_test
+        )
+
+        # TEST 9 - No search results
+        def no_results_test():
+            page.goto(BASE_URL + "/items")
+            page.get_by_label(
+                "Search by title, category or location"
+            ).fill(f"DefinitelyNotAnItem_{run_id}")
+            page.get_by_role("button", name="Search").click()
+
+            expect(page.locator("#no-results")).to_be_visible()
+            return "No matching items message displayed."
+
+        record_result(
+            browser_name, "FT-09", "Search for a nonexistent item",
+            "Website displays a no matching items message.",
+            no_results_test
+        )
+
+        # TEST 10 - Logout and session protection
+        def logout_test():
+            ensure_logged_in(page, test_email, TEST_PASSWORD)
+            page.get_by_role("link", name="Logout").click()
+
+            expect(page).to_have_url(BASE_URL + "/login")
+            expect(page.get_by_role("alert")).to_contain_text(
+                "logged out successfully"
+            )
+
+            page.goto(BASE_URL + "/dashboard")
+            expect(page).to_have_url(BASE_URL + "/login")
+            return "Logout succeeded; protected Dashboard redirected to Login."
+
+        record_result(
+            browser_name, "FT-10", "Logout and session protection",
+            "Logout clears the session and blocks Dashboard access.",
+            logout_test
+        )
+
+        # TEST 11 - Health endpoint
+        def health_test():
+            response = page.request.get(BASE_URL + "/health")
+            assert response.status == 200, (
+                f"Expected HTTP 200, got {response.status}"
+            )
+            assert response.json().get("status") == "ok"
+            return "Health endpoint returned HTTP 200 and status ok."
+
+        record_result(
+            browser_name, "FT-11", "Health endpoint",
+            "Endpoint returns HTTP 200 and status ok.", health_test
+        )
+
+    finally:
+        context.close()
+        browser.close()
+
+
+# ============================================================
+# CROSS-BROWSER TESTING
+# ============================================================
+
+def run_cross_browser_tests(playwright):
+    browser_types = {
+        "chromium": playwright.chromium,
+        "firefox": playwright.firefox,
+        "webkit": playwright.webkit,
+    }
+
+    for browser_name in BROWSER_NAMES:
+        browser_type = browser_types[browser_name]
+
+        print("\n" + "#" * 78)
+        print(f"CROSS-BROWSER TESTING: {browser_name.upper()}")
+        print("#" * 78)
+
+        try:
+            run_browser_tests(browser_name, browser_type)
+
+        except Exception as error:
+            # A missing browser installation should not hide results from
+            # the other browsers. Mark this browser as unavailable.
+            message = f"{type(error).__name__}: {str(error).splitlines()[0]}"
+            print(f"[SKIP] Could not run {browser_name}: {message}")
+            print(
+                "Install browser binaries using: "
+                "python -m playwright install chromium firefox webkit"
+            )
+
+            ALL_RESULTS.append({
+                "browser": browser_name,
+                "test_id": "BROWSER-SETUP",
+                "test_name": f"{browser_name} browser setup",
+                "expected": "Browser launches and functional tests execute.",
+                "actual": message,
+                "final": "Browser suite could not be completed.",
+                "status": "SKIP",
+            })
+
+
+# ============================================================
+# RESPONSIVE SMOKE TEST
+# ============================================================
+
+def run_responsive_tests(playwright):
+    print("\n" + "=" * 78)
+    print("RESPONSIVE UI SMOKE TESTS (CHROMIUM)")
+    print("=" * 78)
+
+    browser = playwright.chromium.launch(headless=False, slow_mo=250)
+    context = browser.new_context()
+    page = context.new_page()
+
+    try:
+        viewports = [
+            ("Desktop", 1366, 768),
+            ("Tablet", 768, 1024),
+            ("Mobile", 390, 844),
+        ]
+
+        for name, width, height in viewports:
+            def viewport_test():
+                page.set_viewport_size({"width": width, "height": height})
+                page.goto(BASE_URL)
+                expect(page.get_by_role(
+                    "heading", name="Welcome to FindIt Portal"
+                )).to_be_visible()
+
+                # Basic horizontal-overflow check.
+                dimensions = page.evaluate(
+                    """() => ({
+                        pageWidth: document.documentElement.scrollWidth,
+                        viewportWidth: document.documentElement.clientWidth
+                    })"""
+                )
+                assert dimensions["pageWidth"] <= dimensions["viewportWidth"], (
+                    f"Horizontal overflow: {dimensions}"
+                )
+                return f"{width}x{height}: heading visible; no horizontal overflow."
+
+            record_result(
+                "chromium", f"RT-{name.upper()}",
+                f"Responsive layout - {name}",
+                f"Page fits a {width}x{height} viewport without horizontal overflow.",
+                viewport_test,
+            )
+    finally:
+        context.close()
+        browser.close()
+
+
+# ============================================================
+# FINAL LOST ITEMS PAGE
+# ============================================================
+
+def show_final_lost_items(playwright):
+    print("\n" + "=" * 78)
+    print("FINAL SCREEN: ALL REPORTED LOST ITEMS")
+    print("=" * 78)
+
+    browser = playwright.chromium.launch(headless=False, slow_mo=200)
+    page = browser.new_page(viewport={"width": 1366, "height": 850})
+
+    try:
+        page.goto(BASE_URL + "/items?status=Lost")
+        expect(page.get_by_role(
+            "heading", name="Search Lost and Found Items"
+        )).to_be_visible()
+
+        articles = page.locator("article.item-result")
+        count = articles.count()
+        print(f"Total reported Lost items: {count}\n")
+
+        for index in range(count):
+            article = articles.nth(index)
+            title = article.locator("h2").inner_text()
+            paragraphs = article.locator("p").all_inner_texts()
+
+            print(f"{index + 1}. {title}")
+            for paragraph in paragraphs:
+                print("   " + paragraph)
+            print("-" * 60)
+
+        print(f"\nThe browser will remain open for {FINAL_PAGE_SECONDS} seconds.")
+        page.wait_for_timeout(FINAL_PAGE_SECONDS * 1000)
+
+    finally:
+        browser.close()
+
+
+# ============================================================
+# FINAL REPORT
+# ============================================================
+
+def print_final_report():
+    print("\n" + "=" * 110)
+    print("FINAL AUTOMATION TEST REPORT")
+    print("=" * 110)
+
+    headers = (
+        "Browser", "Test ID", "Test Name", "Expected Result",
+        "Actual Result", "Final Result", "Status"
+    )
+
+    for result in ALL_RESULTS:
+        print("-" * 110)
+        for heading, key in zip(
+            headers,
+            ("browser", "test_id", "test_name", "expected",
+             "actual", "final", "status"),
+        ):
+            print(f"{heading}: {result[key]}")
+
+    passed = sum(r["status"] == "PASS" for r in ALL_RESULTS)
+    failed = sum(r["status"] == "FAIL" for r in ALL_RESULTS)
+    skipped = sum(r["status"] == "SKIP" for r in ALL_RESULTS)
+
+    print("\n" + "=" * 78)
+    print("SUMMARY")
+    print("=" * 78)
+    print("Total recorded results:", len(ALL_RESULTS))
+    print("Passed:", passed)
+    print("Failed:", failed)
+    print("Skipped:", skipped)
+
+    if failed == 0 and skipped == 0:
+        print("All recorded tests passed.")
+    elif failed:
+        print("Some tests failed. Review the actual results above.")
+    else:
+        print("Some browser tests were skipped. Check browser installation.")
+
+
+# ============================================================
+# AUTOMATIC STARTUP
+# ============================================================
+
+def start_website():
+    init_db()
+    print("Starting FindIt Portal at", BASE_URL)
+    app.run(
+        host="127.0.0.1",
+        port=5000,
+        debug=False,
+        use_reloader=False,
+        threaded=True,
+    )
+
+
+def main():
+    init_db()
+    server_process = None
+
+    try:
+        server_process = subprocess.Popen(
+            [sys.executable, str(Path(__file__).resolve()), "--server"],
+            cwd=str(BASE_DIR),
+        )
+
+        wait_for_website(server_process)
+        print("Website started successfully:", BASE_URL)
+
+        with sync_playwright() as playwright:
+            run_cross_browser_tests(playwright)
+            run_responsive_tests(playwright)
+
+            if SHOW_FINAL_PAGE:
+                show_final_lost_items(playwright)
+
+        print_final_report()
+
+    except KeyboardInterrupt:
+        print("\nAutomation stopped by user.")
+
+    except Exception as error:
+        print("\nAUTOMATION ERROR:", type(error).__name__, str(error))
+        print("Check the Python packages, browser installation, and port 5000.")
+
+    finally:
+        if server_process is not None and server_process.poll() is None:
+            server_process.terminate()
+            try:
+                server_process.wait(timeout=5)
+            except subprocess.TimeoutExpired:
+                server_process.kill()
+                server_process.wait()
+
+        print("\nFindIt Portal automation finished.")
+
+
+if __name__ == "__main__":
+    if "--server" in sys.argv:
+        start_website()
+    else:
+        main()
+
